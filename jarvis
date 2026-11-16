@@ -1,0 +1,791 @@
+# -*- coding: utf-8 -*-
+"""
+J.A.R.V.I.S. — Windows masaüstü sürümü
+
+Sesle konuşan, ekranı görebilen, bilgisayarını kontrol eden kişisel asistan.
+  Beyin        : Claude (Anthropic API, araç kullanımı + web araması)
+  Ses girişi   : Google konuşma tanıma (tr-TR)   -> "Jarvis ..." diyerek uyandır
+  Ses çıkışı   : Edge TTS (tr-TR-AhmetNeural), yoksa Windows SAPI
+  Arayüz       : Tkinter HUD (arc reaktör, canlı ses halkası, sistem göstergeleri)
+"""
+import os, sys, io, re, json, math, time, queue, random, base64, asyncio
+import tempfile, threading, subprocess, webbrowser, platform
+import urllib.request, urllib.parse
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import simpledialog, messagebox
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+# ───────────────────────────── Ayarlar ─────────────────────────────
+KULLANICI = "Alper"                 # JARVIS sana "Alper Bey" diye hitap eder
+MODEL = "claude-sonnet-5-5"         # istersen başka bir Claude modeli yaz
+SES = "tr-TR-AhmetNeural"           # Edge TTS Türkçe erkek sesi
+SES_HIZ, SES_PERDE = "+4%", "-6Hz"
+DIL = "tr-TR"
+UYANDIRMA = ["jarvis", "jarvıs", "carvis", "çarvis", "çarvıs", "harvis", "jarwis", "cervis", "jarviz"]
+SOHBET_SURESI = 12                  # yanıttan sonra bu kadar sn uyandırma kelimesi gerekmez
+WEB_ARAMASI = True                  # Claude'un internetten bilgi çekmesi
+
+DATA = Path.home() / ".jarvis"
+DATA.mkdir(exist_ok=True)
+CONFIG, NOTLAR = DATA / "config.json", DATA / "notlar.txt"
+EKRAN_KLASORU = Path.home() / "Pictures" / "JARVIS"
+
+# ─────────────────── Opsiyonel paketler (eksikse uyarır) ───────────────────
+EKSIK = []
+def _opt(mod, pip):
+    try:
+        return __import__(mod)
+    except Exception:
+        EKSIK.append(pip)
+        return None
+
+anthropic = _opt("anthropic", "anthropic")
+sr = _opt("speech_recognition", "SpeechRecognition")
+edge_tts = _opt("edge_tts", "edge-tts")
+pygame = _opt("pygame", "pygame")
+psutil = _opt("psutil", "psutil")
+pyautogui = _opt("pyautogui", "pyautogui pillow")
+pyperclip = _opt("pyperclip", "pyperclip")
+WIN = sys.platform.startswith("win")
+
+
+def tr_lower(s):
+    return s.replace("İ", "i").replace("I", "ı").lower()
+
+
+def temizle(s):
+    return re.sub(r"[*_`#>]+", "", s).strip()
+
+
+APP_TAKMA = {
+    "chrome": "chrome", "google chrome": "chrome", "krom": "chrome", "tarayıcı": "msedge",
+    "edge": "msedge", "firefox": "firefox", "not defteri": "notepad", "notepad": "notepad",
+    "hesap makinesi": "calc", "hesap makinası": "calc", "paint": "mspaint",
+    "dosya gezgini": "explorer", "gezgin": "explorer", "görev yöneticisi": "taskmgr",
+    "ayarlar": "ms-settings:", "cmd": "cmd", "komut istemi": "cmd", "powershell": "powershell",
+    "spotify": "spotify", "discord": "discord", "steam": "steam", "vscode": "code",
+    "visual studio code": "code", "word": "winword", "excel": "excel", "powerpoint": "powerpnt",
+    "whatsapp": "whatsapp:", "telegram": "telegram", "ekran alıntısı": "snippingtool",
+}
+
+# ───────────────────────────── Araç tanımları ─────────────────────────────
+S = lambda d: {"type": "string", "description": d}
+N = lambda d: {"type": "number", "description": d}
+B = lambda d: {"type": "boolean", "description": d}
+
+def _tool(name, desc, props=None, req=None):
+    return {"name": name, "description": desc,
+            "input_schema": {"type": "object", "properties": props or {}, "required": req or []}}
+
+TOOLS = [
+    _tool("open_application", "Bilgisayarda bir uygulama açar (chrome, spotify, discord, not defteri, hesap makinesi, ayarlar, vscode, steam, word, excel...).", {"name": S("Uygulama adı")}, ["name"]),
+    _tool("open_website", "Varsayılan tarayıcıda bir site açar.", {"url": S("Adres, örn. youtube.com")}, ["url"]),
+    _tool("browser_search", "Tarayıcıda arama açar (kullanıcı sonuçları GÖRSÜN istediğinde). Bilgi öğrenmek için web_search kullan.", {"query": S("Arama ifadesi"), "site": {"type": "string", "enum": ["google", "youtube", "maps"]}}, ["query"]),
+    _tool("system_status", "CPU, RAM, disk, pil ve çalışma süresini verir."),
+    _tool("media_control", "Medya ve ses tuşları. Her ses adımı yaklaşık %2'dir (örn. %20 için 10 adım).", {"action": {"type": "string", "enum": ["play_pause", "next", "previous", "volume_up", "volume_down", "mute"]}, "steps": N("Tekrar sayısı, varsayılan 1")}, ["action"]),
+    _tool("take_screenshot", "Ekran görüntüsü alıp Resimler/JARVIS klasörüne kaydeder."),
+    _tool("look_at_screen", "Ekranı görür ve soruyu yanıtlar ('ekranda ne var', 'bu hatayı oku', 'şu yazıyı özetle').", {"question": S("Ekran hakkındaki soru")}),
+    _tool("type_text", "İmlecin olduğu yere metin yazar (Türkçe karakter destekli).", {"text": S("Yazılacak metin"), "press_enter": B("Sonda Enter'a bas")}, ["text"]),
+    _tool("press_keys", "Klavye kısayolu basar. Örn. ['ctrl','c'], ['alt','tab'], ['win','d'].", {"keys": {"type": "array", "items": {"type": "string"}}}, ["keys"]),
+    _tool("set_timer", "Zamanlayıcı kurar; süre dolunca sesli haber verir.", {"seconds": N("Saniye"), "label": S("Ne için")}, ["seconds"]),
+    _tool("save_note", "Not defterine bir not ekler.", {"text": S("Not")}, ["text"]),
+    _tool("read_notes", "Kayıtlı son notları okur."),
+    _tool("find_files", "Masaüstü, Belgeler, İndirilenler, Resimler vb. klasörlerde dosya adına göre arar.", {"query": S("Dosya adında geçen kelimeler")}, ["query"]),
+    _tool("open_path", "Bir dosya ya da klasörü açar.", {"path": S("Tam yol")}, ["path"]),
+    _tool("weather", "Bir şehrin hava durumunu getirir.", {"city": S("Şehir adı")}, ["city"]),
+    _tool("run_command", "PowerShell komutu çalıştırır (kullanıcıdan onay alınır). Başka araç yetmediğinde kullan.", {"command": S("PowerShell komutu")}, ["command"]),
+    _tool("power_control", "Bilgisayarı kilitler, uyutur, kapatır veya yeniden başlatır (kapatma/yeniden başlatma onay ister).", {"action": {"type": "string", "enum": ["lock", "sleep", "shutdown", "restart", "cancel"]}}, ["action"]),
+    _tool("exit_assistant", "JARVIS uygulamasını kapatır."),
+]
+WEB_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+
+# ───────────────────────────── Görünüm ─────────────────────────────
+BG_RGB = (3, 8, 12)
+BG, PANEL, FG = "#03080c", "#06141c", "#9be9ff"
+RENK = {"idle": (0, 200, 255), "listening": (0, 255, 170), "thinking": (255, 176, 0), "speaking": (110, 235, 255)}
+DURUM_YAZI = {"idle": "Beklemede", "listening": "Dinliyorum", "thinking": "İşleniyor", "speaking": "Konuşuyor"}
+F_SM, F_MD, F_LG = ("Consolas", 10), ("Consolas", 12), ("Consolas", 26, "bold")
+
+
+def mix(c, a):
+    return "#%02x%02x%02x" % tuple(int(BG_RGB[i] + (c[i] - BG_RGB[i]) * a) for i in range(3))
+
+
+# ═════════════════════════════ Ana sınıf ═════════════════════════════
+class Jarvis:
+    def __init__(self):
+        if WIN:
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                pass
+        self.root = tk.Tk()
+        self.root.title("J.A.R.V.I.S.")
+        self.root.geometry("1180x720")
+        self.root.minsize(900, 560)
+        self.root.configure(bg=BG)
+        self.root.protocol("WM_DELETE_WINDOW", self.kapat)
+
+        self.q = queue.Queue()
+        self.state = "idle"
+        self.running = True
+        self.busy = self.speaking = False
+        self.mic_on = bool(sr)
+        self.voice_on = True
+        self.quit_after = False
+        self.active_until = 0.0
+        self.cmd_lock, self.speak_lock = threading.Lock(), threading.Lock()
+        self.history = []
+        self.web = WEB_ARAMASI
+        self.t0, self.ph, self.fr = time.time(), 0.0, 0
+        self.lv = [0.1] * 72
+        self.stats = (None, None, None, None)
+
+        self.arayuz_kur()
+        self.client = self.istemci_kur()
+        if pygame:
+            try:
+                pygame.mixer.init()
+            except Exception as e:
+                self.log("err", f"Ses çıkışı başlatılamadı: {e}")
+
+        if EKSIK:
+            self.log("sys", "Eksik paket: " + ", ".join(sorted(set(EKSIK))) + "  →  pip install " + " ".join(sorted(set(EKSIK))))
+
+        self.pump()
+        self.animate()
+        threading.Thread(target=self.dinleme_dongusu, daemon=True).start()
+        self.root.after(700, lambda: self.async_calistir(self.acilis))
+
+    # ───────────── UI iskeleti ─────────────
+    def arayuz_kur(self):
+        self.cv = tk.Canvas(self.root, bg=BG, highlightthickness=0)
+        self.cv.pack(side="left", fill="both", expand=True)
+
+        sag = tk.Frame(self.root, bg=PANEL, width=400)
+        sag.pack(side="right", fill="y")
+        sag.pack_propagate(False)
+
+        tk.Label(sag, text="Kayıt", bg=PANEL, fg=mix(RENK["idle"], 0.9), font=F_MD, anchor="w").pack(fill="x", padx=14, pady=(14, 4))
+        self.logbox = tk.Text(sag, bg=BG, fg=FG, font=("Consolas", 11), wrap="word", bd=0, padx=10, pady=10,
+                              highlightthickness=1, highlightbackground=mix(RENK["idle"], 0.25), state="disabled", cursor="arrow")
+        self.logbox.pack(fill="both", expand=True, padx=14)
+        self.logbox.tag_config("user", foreground="#ffffff")
+        self.logbox.tag_config("jarvis", foreground=mix(RENK["idle"], 1))
+        self.logbox.tag_config("sys", foreground="#4a7f8f")
+        self.logbox.tag_config("err", foreground="#ff6b5e")
+
+        self.entry = tk.Entry(sag, bg=BG, fg="#ffffff", insertbackground="#ffffff", font=("Consolas", 12), bd=0,
+                              highlightthickness=1, highlightbackground=mix(RENK["idle"], 0.4), highlightcolor=mix(RENK["idle"], 1))
+        self.entry.pack(fill="x", padx=14, pady=(10, 6), ipady=7)
+        self.entry.bind("<Return>", self.yazili_gonder)
+        self.entry.focus_set()
+
+        bar = tk.Frame(sag, bg=PANEL)
+        bar.pack(fill="x", padx=14, pady=(0, 14))
+        def btn(text, cmd):
+            b = tk.Button(bar, text=text, command=cmd, bg=BG, fg=FG, activebackground=mix(RENK["idle"], 0.3),
+                          activeforeground="#ffffff", relief="flat", bd=0, font=F_SM, padx=8, pady=6, cursor="hand2")
+            b.pack(side="left", expand=True, fill="x", padx=2)
+            return b
+        self.b_mic = btn("Mikrofon: açık" if self.mic_on else "Mikrofon: yok", self.mic_degistir)
+        self.b_ses = btn("Ses: açık", self.ses_degistir)
+        btn("Sus", self.sustur)
+
+        self.root.bind("<F11>", lambda e: self.root.attributes("-fullscreen", not self.root.attributes("-fullscreen")))
+        self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
+
+    def mic_degistir(self):
+        if not sr:
+            return
+        self.mic_on = not self.mic_on
+        self.b_mic.config(text="Mikrofon: açık" if self.mic_on else "Mikrofon: kapalı")
+
+    def ses_degistir(self):
+        self.voice_on = not self.voice_on
+        self.b_ses.config(text="Ses: açık" if self.voice_on else "Ses: kapalı")
+
+    def sustur(self):
+        if pygame:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+
+    def yazili_gonder(self, _=None):
+        t = self.entry.get().strip()
+        if t:
+            self.entry.delete(0, "end")
+            self.async_calistir(lambda: self.isle(t))
+
+    # ───────────── Thread-güvenli UI ─────────────
+    def ui(self, fn, *a):
+        self.q.put((fn, a))
+
+    def ui_bekle(self, fn):
+        kutu, ev = {}, threading.Event()
+        def run():
+            try:
+                kutu["v"] = fn()
+            except Exception:
+                kutu["v"] = None
+            ev.set()
+        self.q.put((run, ()))
+        ev.wait(180)
+        return kutu.get("v")
+
+    def pump(self):
+        try:
+            while True:
+                fn, a = self.q.get_nowait()
+                fn(*a)
+        except queue.Empty:
+            pass
+        if self.running:
+            self.root.after(30, self.pump)
+
+    def log(self, kim, metin):
+        self.ui(self._log, kim, metin)
+
+    def _log(self, kim, metin):
+        onek = {"user": "SEN     ", "jarvis": "JARVIS  ", "sys": "· ", "err": "! "}[kim]
+        sonek = "\n\n" if kim in ("user", "jarvis") else "\n"
+        self.logbox.config(state="normal")
+        self.logbox.insert("end", onek + metin + sonek, kim)
+        self.logbox.see("end")
+        self.logbox.config(state="disabled")
+
+    def set_state(self, s):
+        self.state = s
+
+    def async_calistir(self, fn):
+        threading.Thread(target=fn, daemon=True).start()
+
+    # ───────────── HUD animasyonu ─────────────
+    def animate(self):
+        if not self.running:
+            return
+        cv = self.cv
+        cv.delete("hud")
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w > 80:
+            self.fr += 1
+            t = time.time() - self.t0
+            c = RENK[self.state]
+            hiz = {"idle": 0.6, "listening": 1.0, "thinking": 3.4, "speaking": 1.7}[self.state]
+            self.ph += hiz * 1.2
+            cx, cy = w * 0.5, h * 0.45
+            R = min(w, h) * 0.27
+
+            for f, a in ((1.5, 0.10), (1.12, 0.18)):
+                cv.create_oval(cx - R * f, cy - R * f, cx + R * f, cy + R * f, outline=mix(c, a), tags="hud")
+
+            rt = R * 1.3
+            for i in range(90):
+                ang = math.radians(i * 4 - self.ph * 0.3)
+                uzun = i % 5 == 0
+                r1 = rt + R * (0.07 if uzun else 0.03)
+                cv.create_line(cx + math.cos(ang) * rt, cy + math.sin(ang) * rt, cx + math.cos(ang) * r1, cy + math.sin(ang) * r1,
+                               fill=mix(c, 0.9 if uzun else 0.4), tags="hud")
+
+            for rf, kal, n, spd, al in ((1.15, 4, 3, 1.0, 0.9), (0.95, 2, 6, -1.6, 0.7), (0.78, 6, 2, 2.2, 0.85)):
+                r, seg = R * rf, 360 / n
+                for k in range(n):
+                    cv.create_arc(cx - r, cy - r, cx + r, cy + r, start=(self.ph * spd + k * seg) % 360, extent=seg * 0.62,
+                                  style="arc", outline=mix(c, al), width=kal, tags="hud")
+
+            N_ = len(self.lv)
+            rb = R * 0.6
+            for i in range(N_):
+                if self.state == "speaking":
+                    hedef = 0.2 + 0.8 * abs(math.sin(i * 0.37 + t * 11)) * random.uniform(0.5, 1)
+                elif self.state == "listening":
+                    hedef = 0.1 + 0.28 * abs(math.sin(i * 0.5 + t * 4))
+                elif self.state == "thinking":
+                    hedef = 1.0 if ((i - self.ph * 0.5) % N_) < 9 else 0.08
+                else:
+                    hedef = 0.08 + 0.06 * math.sin(i * 0.3 + t * 1.5)
+                self.lv[i] += (hedef - self.lv[i]) * 0.35
+                a = math.radians(i * 360 / N_ - 90)
+                L = R * (0.03 + 0.22 * self.lv[i])
+                cv.create_line(cx + math.cos(a) * rb, cy + math.sin(a) * rb, cx + math.cos(a) * (rb + L), cy + math.sin(a) * (rb + L),
+                               fill=mix(c, 0.35 + 0.65 * min(self.lv[i], 1)), width=3, tags="hud")
+
+            genlik = 0.18 * abs(math.sin(t * 10)) if self.state == "speaking" else 0.10
+            rc = R * 0.3 * (1 + genlik * math.sin(t * 2.4))
+            for f, a in ((1.9, 0.05), (1.6, 0.09), (1.3, 0.16)):
+                cv.create_oval(cx - rc * f, cy - rc * f, cx + rc * f, cy + rc * f, fill=mix(c, a), outline="", tags="hud")
+            cv.create_oval(cx - rc, cy - rc, cx + rc, cy + rc, fill=mix(c, 0.25), outline=mix(c, 1), width=3, tags="hud")
+            ri = rc * 0.55
+            cv.create_oval(cx - ri, cy - ri, cx + ri, cy + ri, fill=mix(c, 0.85), outline="", tags="hud")
+            tri = [(cx + math.cos(math.radians(a)) * ri * 0.8, cy + math.sin(math.radians(a)) * ri * 0.8) for a in (-90, 30, 150)]
+            cv.create_polygon(tri, fill=BG, outline=mix(c, 1), width=2, tags="hud")
+
+            cv.create_text(cx, cy + R * 1.62, text="J.A.R.V.I.S.", fill=mix(c, 1), font=F_LG, tags="hud")
+            cv.create_text(cx, cy + R * 1.62 + 34, text=DURUM_YAZI[self.state], fill=mix(c, 0.7), font=F_MD, tags="hud")
+
+            if psutil and self.fr % 30 == 1:
+                try:
+                    b = psutil.sensors_battery()
+                    self.stats = (psutil.cpu_percent(None), psutil.virtual_memory().percent,
+                                  psutil.disk_usage(os.path.abspath(os.sep)).percent, b.percent if b else None)
+                except Exception:
+                    pass
+            y = 28
+            for ad, val in (("CPU", self.stats[0]), ("RAM", self.stats[1]), ("Disk", self.stats[2]), ("Pil", self.stats[3])):
+                if val is None:
+                    continue
+                cv.create_text(24, y, text=ad, anchor="w", fill=mix(c, 0.8), font=F_SM, tags="hud")
+                cv.create_text(144, y, text=f"%{val:.0f}", anchor="e", fill=mix(c, 0.8), font=F_SM, tags="hud")
+                cv.create_rectangle(24, y + 10, 144, y + 15, outline=mix(c, 0.45), tags="hud")
+                cv.create_rectangle(24, y + 10, 24 + 120 * min(val, 100) / 100, y + 15, fill=mix(c, 0.9), outline="", tags="hud")
+                y += 38
+
+            simdi = datetime.now()
+            cv.create_text(w - 24, 28, text=simdi.strftime("%H:%M:%S"), anchor="e", fill=mix(c, 1), font=("Consolas", 18, "bold"), tags="hud")
+            cv.create_text(w - 24, 54, text=simdi.strftime("%d.%m.%Y"), anchor="e", fill=mix(c, 0.6), font=F_SM, tags="hud")
+            cv.create_text(24, h - 40, text="Mikrofon " + ("açık" if self.mic_on else "kapalı"), anchor="w", fill=mix(c, 0.6), font=F_SM, tags="hud")
+            cv.create_text(24, h - 22, text='"Jarvis" diyerek seslen  ·  F11 tam ekran', anchor="w", fill=mix(c, 0.45), font=F_SM, tags="hud")
+        self.root.after(33, self.animate)
+
+    # ───────────── API istemcisi ─────────────
+    def istemci_kur(self):
+        if not anthropic:
+            self.log("err", "'anthropic' paketi yüklü değil, beyin çalışmaz.")
+            return None
+        anahtar = os.environ.get("ANTHROPIC_API_KEY")
+        if not anahtar and CONFIG.exists():
+            try:
+                anahtar = json.loads(CONFIG.read_text("utf-8")).get("api_key")
+            except Exception:
+                pass
+        if not anahtar:
+            anahtar = simpledialog.askstring("J.A.R.V.I.S.", "Anthropic API anahtarını gir (bir kez sorulur):", show="*", parent=self.root)
+            if anahtar:
+                CONFIG.write_text(json.dumps({"api_key": anahtar.strip()}), "utf-8")
+        if not anahtar:
+            self.log("err", "API anahtarı girilmedi.")
+            return None
+        return anthropic.Anthropic(api_key=anahtar.strip())
+
+    def sistem_istemi(self):
+        simdi = datetime.now()
+        gun = ["Pazartesi", "Salı", "Çarşamba", "Perşembe", "Cuma", "Cumartesi", "Pazar"][simdi.weekday()]
+        return (
+            f"Sen J.A.R.V.I.S.'sin (Just A Rather Very Intelligent System): {KULLANICI}'in bilgisayarında çalışan kişisel yapay zekâ asistanı. "
+            "Tony Stark'ın JARVIS'i gibisin: sakin, çok zeki, nazik, ince ve kuru bir mizahı olan, işini sessizce halleden bir asistan. "
+            f"Kullanıcıya 'efendim' ya da '{KULLANICI} Bey' diye hitap et; bunu abartma.\n"
+            "KURALLAR:\n"
+            "- Yanıtların sesli okunacak: Türkçe, en fazla 1-3 kısa cümle. Markdown, emoji, madde işareti, link kullanma.\n"
+            "- Bir iş istenirse önce ilgili aracı kullan, sonra sonucu tek cümleyle bildir ('Tamamdır efendim, Spotify açıldı').\n"
+            "- Güncel bilgi gerekiyorsa web_search kullan. Bilmediğini uydurma.\n"
+            "- Araçların yetmediği işte dürüst ol; yapamayacağın bir şeyi yapmış gibi davranma.\n"
+            "- Kapatma, komut çalıştırma gibi riskli işlerde sistem zaten onay ister; yine de belirsizse önce sor.\n"
+            f"Şu an: {gun}, {simdi:%d.%m.%Y %H:%M}. Sistem: {platform.platform()}."
+        )
+
+    # ───────────── Beyin ─────────────
+    def cagir(self, araclar):
+        return self.client.messages.create(model=MODEL, max_tokens=1024, system=self.sistem_istemi(),
+                                           tools=araclar, messages=self.history)
+
+    def dusun(self, metin):
+        if not self.client:
+            return "API anahtarı olmadığı için düşünemiyorum efendim. Uygulamayı yeniden başlatıp anahtarı girer misiniz?"
+        while len(self.history) > 24:
+            self.history.pop(0)
+            while self.history and not (self.history[0]["role"] == "user" and isinstance(self.history[0]["content"], str)):
+                self.history.pop(0)
+        n0 = len(self.history)
+        self.history.append({"role": "user", "content": metin})
+        try:
+            return self._dongu()
+        except Exception:
+            del self.history[n0:]      # yarım kalan araç çağrılarını temizle
+            raise
+
+    def _dongu(self):
+        yanit = None
+        for _ in range(10):
+            self.set_state("thinking")
+            araclar = TOOLS + ([WEB_TOOL] if self.web else [])
+            try:
+                yanit = self.cagir(araclar)
+            except Exception as e:
+                if self.web and "web_search" in str(e):
+                    self.web = False
+                    self.log("sys", "Web araması bu hesapta kapalı, onsuz devam ediyorum.")
+                    continue
+                raise
+            self.history.append({"role": "assistant", "content": yanit.content})
+            if yanit.stop_reason == "tool_use":
+                sonuc = []
+                for b in yanit.content:
+                    if b.type == "tool_use":
+                        sonuc.append({"type": "tool_result", "tool_use_id": b.id, "content": self.arac_calistir(b.name, b.input)})
+                self.history.append({"role": "user", "content": sonuc})
+                continue
+            if yanit.stop_reason == "pause_turn":
+                continue
+            break
+        if not yanit:
+            return ""
+        return temizle("".join(b.text for b in yanit.content if b.type == "text"))
+
+    def arac_calistir(self, ad, args):
+        fn = getattr(self, "t_" + ad, None)
+        if not fn:
+            return f"Bilinmeyen araç: {ad}"
+        self.log("sys", f"{ad} {json.dumps(args, ensure_ascii=False)[:110]}")
+        try:
+            return str(fn(**args))[:3000]
+        except Exception as e:
+            return f"Hata: {e}"
+
+    # ───────────── Konuşma akışı ─────────────
+    def isle(self, metin):
+        with self.cmd_lock:
+            self.busy = True
+            try:
+                self.log("user", metin)
+                try:
+                    cevap = self.dusun(metin)
+                except Exception as e:
+                    self.log("err", repr(e)[:300])
+                    cevap = "Bir sorunla karşılaştım efendim. Ayrıntılar kayıt penceresinde."
+                if cevap:
+                    self.konus(cevap)
+                self.set_state("idle")
+                self.active_until = time.time() + SOHBET_SURESI
+            finally:
+                self.busy = False
+            if self.quit_after:
+                self.ui(self.kapat)
+
+    def acilis(self):
+        durum = lambda ok: "hazır" if ok else "devre dışı"
+        for satir in (f"Yapay zekâ çekirdeği: {durum(self.client)}", f"Ses tanıma: {durum(sr)}",
+                      f"Ses sentezi: {durum(edge_tts and pygame)}", f"Bilgisayar kontrolü: {durum(pyautogui)}"):
+            self.log("sys", satir)
+            time.sleep(0.2)
+        s = datetime.now().hour
+        g = "Günaydın" if 5 <= s < 12 else "İyi günler" if s < 18 else "İyi akşamlar" if s < 23 else "İyi geceler"
+        self.konus(f"{g} {KULLANICI} Bey. Tüm sistemler çevrimiçi. Emrinizdeyim.")
+        self.active_until = time.time() + SOHBET_SURESI
+
+    # ───────────── Ses çıkışı ─────────────
+    def konus(self, metin):
+        metin = temizle(metin)
+        self.log("jarvis", metin)
+        if not self.voice_on:
+            return
+        with self.speak_lock:
+            self.speaking = True
+            self.set_state("speaking")
+            try:
+                if edge_tts and pygame:
+                    try:
+                        self._edge(metin)
+                    except Exception as e:
+                        self.log("err", f"Edge TTS çalışmadı ({str(e)[:80]}), Windows sesine geçiyorum.")
+                        self._sapi(metin)
+                else:
+                    self._sapi(metin)
+            except Exception as e:
+                self.log("err", f"Ses hatası: {str(e)[:120]}")
+            finally:
+                self.speaking = False
+                self.set_state("idle")
+
+    def _edge(self, metin):
+        yol = Path(tempfile.gettempdir()) / f"jarvis_{os.getpid()}_{int(time.time() * 1000)}.mp3"
+        async def uret():
+            await edge_tts.Communicate(metin, SES, rate=SES_HIZ, pitch=SES_PERDE).save(str(yol))
+        asyncio.run(uret())
+        pygame.mixer.music.load(str(yol))
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.05)
+        pygame.mixer.music.unload()
+        yol.unlink(missing_ok=True)
+
+    def _sapi(self, metin):
+        import pyttsx3
+        e = pyttsx3.init()
+        for v in e.getProperty("voices"):
+            if "tr" in (v.id + v.name).lower() or "turk" in (v.id + v.name).lower():
+                e.setProperty("voice", v.id)
+                break
+        e.setProperty("rate", 175)
+        e.say(metin)
+        e.runAndWait()
+
+    # ───────────── Ses girişi ─────────────
+    def dinleme_dongusu(self):
+        if not sr:
+            return
+        r = sr.Recognizer()
+        r.pause_threshold = 0.9
+        r.dynamic_energy_threshold = True
+        try:
+            mic = sr.Microphone()
+            with mic as kaynak:
+                r.adjust_for_ambient_noise(kaynak, duration=1.2)
+        except Exception as e:
+            self.log("err", f"Mikrofon açılamadı: {str(e)[:120]}  (PyAudio kurulu mu?)")
+            self.mic_on = False
+            return
+        while self.running:
+            if not self.mic_on or self.speaking or self.busy:
+                time.sleep(0.2)
+                continue
+            if self.state in ("idle", "listening"):
+                self.set_state("listening" if time.time() < self.active_until else "idle")
+            try:
+                with mic as kaynak:
+                    ses = r.listen(kaynak, timeout=2, phrase_time_limit=15)
+            except sr.WaitTimeoutError:
+                continue
+            except Exception:
+                time.sleep(1)
+                continue
+            if self.speaking or self.busy or not self.mic_on:
+                continue
+            try:
+                metin = r.recognize_google(ses, language=DIL)
+            except sr.UnknownValueError:
+                continue
+            except Exception as e:
+                self.log("err", f"Ses tanıma hatası (internet?): {str(e)[:80]}")
+                time.sleep(2)
+                continue
+            self.duyuldu(metin)
+
+    def duyuldu(self, metin):
+        t = tr_lower(metin)
+        uyan = next((w for w in UYANDIRMA if w in t), None)
+        if not uyan and time.time() >= self.active_until:
+            return
+        komut = metin
+        if uyan:
+            i = t.find(uyan)
+            komut = (metin[:i] + metin[i + len(uyan):]).strip(" ,.!?-")
+        if not komut:
+            self.active_until = time.time() + SOHBET_SURESI
+            self.async_calistir(lambda: self.konus(random.choice(["Efendim?", "Sizi dinliyorum.", "Emrinizi bekliyorum."])))
+            return
+        self.async_calistir(lambda: self.isle(komut))
+
+    # ───────────── Onay penceresi ─────────────
+    def onay(self, mesaj):
+        self.konus("Onayınız gerekiyor efendim.")
+        return bool(self.ui_bekle(lambda: messagebox.askyesno("J.A.R.V.I.S. — Onay", mesaj, parent=self.root)))
+
+    # ═════════════ ARAÇLAR ═════════════
+    def t_open_application(self, name):
+        hedef = APP_TAKMA.get(tr_lower(name).strip(), name.strip())
+        if re.search(r'["&|<>^%]', hedef):
+            return "Geçersiz uygulama adı."
+        if WIN:
+            r = subprocess.run(f'start "" "{hedef}"', shell=True, capture_output=True)
+            return "Açıldı." if r.returncode == 0 else f"'{name}' bulunamadı."
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-a", hedef])
+        else:
+            subprocess.Popen([hedef])
+        return "Açıldı."
+
+    def t_open_website(self, url):
+        if not re.match(r"^https?://", url):
+            url = "https://" + url
+        webbrowser.open(url)
+        return "Açıldı."
+
+    def t_browser_search(self, query, site="google"):
+        taban = {"google": "https://www.google.com/search?q=", "youtube": "https://www.youtube.com/results?search_query=",
+                 "maps": "https://www.google.com/maps/search/"}[site]
+        webbrowser.open(taban + urllib.parse.quote(query))
+        return "Arama açıldı."
+
+    def t_system_status(self):
+        v = psutil.virtual_memory()
+        d = psutil.disk_usage(os.path.abspath(os.sep))
+        b = psutil.sensors_battery()
+        up = int(time.time() - psutil.boot_time())
+        s = (f"CPU %{psutil.cpu_percent(interval=0.4):.0f}, RAM %{v.percent:.0f} ({v.used / 2**30:.1f}/{v.total / 2**30:.1f} GB), "
+             f"disk %{d.percent:.0f} dolu, açık kalma {up // 3600} saat {up % 3600 // 60} dakika")
+        if b:
+            s += f", pil %{b.percent:.0f}" + (" (şarjda)" if b.power_plugged else "")
+        return s
+
+    def t_media_control(self, action, steps=1):
+        tus = {"play_pause": "playpause", "next": "nexttrack", "previous": "prevtrack",
+               "volume_up": "volumeup", "volume_down": "volumedown", "mute": "volumemute"}[action]
+        for _ in range(max(1, min(int(steps), 50))):
+            pyautogui.press(tus)
+        return "Tamam."
+
+    def _ekran(self):
+        self.ui_bekle(lambda: self.root.withdraw())
+        time.sleep(0.5)
+        try:
+            return pyautogui.screenshot()
+        finally:
+            self.ui(self.root.deiconify)
+
+    def t_take_screenshot(self):
+        EKRAN_KLASORU.mkdir(parents=True, exist_ok=True)
+        yol = EKRAN_KLASORU / f"ekran_{datetime.now():%Y%m%d_%H%M%S}.png"
+        self._ekran().save(yol)
+        return f"Kaydedildi: {yol}"
+
+    def t_look_at_screen(self, question="Ekranda ne var?"):
+        img = self._ekran()
+        img.thumbnail((1568, 1568))
+        buf = io.BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=80)
+        b64 = base64.standard_b64encode(buf.getvalue()).decode()
+        r = self.client.messages.create(model=MODEL, max_tokens=700, messages=[{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+            {"type": "text", "text": f"Bu bir bilgisayar ekran görüntüsü. Türkçe ve kısa yanıtla: {question}"}]}])
+        return "".join(b.text for b in r.content if b.type == "text")
+
+    def _odak_birak(self):
+        self.ui_bekle(lambda: self.root.withdraw())
+        time.sleep(0.4)
+
+    def t_type_text(self, text, press_enter=False):
+        self._odak_birak()
+        try:
+            return self._yaz(text, press_enter)
+        finally:
+            self.ui(self.root.deiconify)
+
+    def _yaz(self, text, press_enter):
+        eski = None
+        try:
+            eski = pyperclip.paste()
+        except Exception:
+            pass
+        pyperclip.copy(text)
+        time.sleep(0.15)
+        pyautogui.hotkey("ctrl", "v")
+        if press_enter:
+            time.sleep(0.15)
+            pyautogui.press("enter")
+        time.sleep(0.3)
+        if eski is not None:
+            pyperclip.copy(eski)
+        return "Yazıldı."
+
+    def t_press_keys(self, keys):
+        keys = [str(k).lower() for k in keys]
+        kotu = [k for k in keys if k not in pyautogui.KEYBOARD_KEYS]
+        if kotu:
+            return f"Geçersiz tuş: {kotu}"
+        self._odak_birak()
+        try:
+            pyautogui.hotkey(*keys)
+        finally:
+            self.ui(self.root.deiconify)
+        return "Basıldı."
+
+    def t_set_timer(self, seconds, label="Zamanlayıcı"):
+        t = threading.Timer(float(seconds), lambda: self.konus(f"Efendim, {label} süresi doldu."))
+        t.daemon = True
+        t.start()
+        return f"{int(float(seconds))} saniyelik zamanlayıcı kuruldu."
+
+    def t_save_note(self, text):
+        with open(NOTLAR, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%d.%m.%Y %H:%M}] {text}\n")
+        return "Not kaydedildi."
+
+    def t_read_notes(self):
+        if not NOTLAR.exists():
+            return "Kayıtlı not yok."
+        return "".join(NOTLAR.read_text("utf-8").splitlines(True)[-15:])
+
+    def t_find_files(self, query):
+        h = Path.home()
+        kokler = [h / d for d in ("Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music")]
+        kokler += [h / "OneDrive" / d for d in ("Desktop", "Documents", "Masaüstü", "Belgeler")]
+        kelimeler = tr_lower(query).split()
+        bulunan, sayac = [], 0
+        for kok in kokler:
+            if not kok.exists():
+                continue
+            for dp, dn, fn in os.walk(kok):
+                dn[:] = [d for d in dn if not d.startswith(".") and d.lower() not in ("node_modules", "__pycache__")]
+                for ad in fn + dn:
+                    sayac += 1
+                    if all(k in tr_lower(ad) for k in kelimeler):
+                        bulunan.append(os.path.join(dp, ad))
+                if len(bulunan) >= 10 or sayac > 60000:
+                    break
+            if len(bulunan) >= 10 or sayac > 60000:
+                break
+        return "\n".join(bulunan) if bulunan else "Bulunamadı."
+
+    def t_open_path(self, path):
+        if Path(path).suffix.lower() in (".exe", ".bat", ".cmd", ".ps1", ".msi", ".vbs", ".js", ".scr", ".com") \
+                and not self.onay(f"Şu çalıştırılabilir dosya açılsın mı?\n\n{path}"):
+            return "Kullanıcı reddetti."
+        if WIN:
+            os.startfile(path)
+        else:
+            subprocess.Popen(["xdg-open" if sys.platform != "darwin" else "open", path])
+        return "Açıldı."
+
+    def t_weather(self, city):
+        url = "https://wttr.in/" + urllib.parse.quote(city) + "?format=j1&lang=tr"
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "curl/8"}), timeout=10) as r:
+            d = json.load(r)
+        c, bugun = d["current_condition"][0], d["weather"][0]
+        aciklama = (c.get("lang_tr") or c["weatherDesc"])[0]["value"]
+        return (f"{city}: {c['temp_C']}°C, hissedilen {c['FeelsLikeC']}°C, {aciklama}, nem %{c['humidity']}, "
+                f"rüzgar {c['windspeedKmph']} km/s. Bugün en düşük {bugun['mintempC']}°C, en yüksek {bugun['maxtempC']}°C.")
+
+    def t_run_command(self, command):
+        if not self.onay(f"JARVIS şu komutu çalıştırmak istiyor:\n\n{command}\n\nİzin veriyor musun?"):
+            return "Kullanıcı komutu reddetti."
+        arg = ["powershell", "-NoProfile", "-Command", command] if WIN else command
+        r = subprocess.run(arg, shell=not WIN, capture_output=True, text=True, errors="replace", timeout=60)
+        return ((r.stdout or "") + (r.stderr or "")).strip()[:1500] or f"Komut tamamlandı (kod {r.returncode})."
+
+    def t_power_control(self, action):
+        soru = {"shutdown": "Bilgisayar KAPATILSIN mı? (20 sn sonra)", "restart": "Bilgisayar YENİDEN BAŞLATILSIN mı? (20 sn sonra)",
+                "sleep": "Bilgisayar uyutulsun mu?"}.get(action)
+        if soru and not self.onay(soru):
+            return "Kullanıcı reddetti."
+        if not WIN:
+            return "Bu işlem şimdilik yalnızca Windows'ta destekleniyor."
+        komut = {"lock": "rundll32.exe user32.dll,LockWorkStation", "sleep": "rundll32.exe powrprof.dll,SetSuspendState 0,1,0",
+                 "shutdown": "shutdown /s /t 20", "restart": "shutdown /r /t 20", "cancel": "shutdown /a"}[action]
+        subprocess.run(komut, shell=True)
+        return "Tamam."
+
+    def t_exit_assistant(self):
+        self.quit_after = True
+        return "Kapanış başlatıldı, veda cümlesini söyle."
+
+    # ───────────── Kapanış / döngü ─────────────
+    def kapat(self):
+        self.running = False
+        try:
+            if pygame:
+                pygame.mixer.quit()
+        except Exception:
+            pass
+        self.root.destroy()
+
+    def calistir(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__":
+    Jarvis().calistir()
